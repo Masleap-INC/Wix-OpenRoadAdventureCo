@@ -1,0 +1,455 @@
+/*********
+ .jsw file
+ *********
+
+ Backend .jsw files contain functions that run on the server side but can be called from page code and frontend files.
+ Use backend functions to keep code private and hidden from a user's browser. More info:
+
+ https://support.wix.com/en/article/velo-web-modules-calling-backend-code-from-the-frontend
+
+**********/
+import {
+    fetch
+} from 'wix-fetch';
+import {
+    getSecret,
+} from 'wix-secrets-backend';
+import wixData from 'wix-data';
+import wixStoresBackend from 'wix-stores-backend';
+import {
+    notifications
+} from 'wix-crm-backend';
+
+import { roundNumberV1, roundNumberV2 } from "../utils.js";
+import { reformattingDescriptions, reformattingSpacifications } from "../parser.js";
+
+// Urls properties
+const baseUrl = "https://api.frontrunner.co.za/";
+const endpoint = "customer/Pricelist/json/EUR/";
+const language = "EN";
+const colValues = ['Bom', 'Images', 'FittingInstructions', 'Categories', 'Narrative'];
+
+
+// Create product in wix-store
+function createProduct(myProduct) {
+    return wixStoresBackend.createProduct(myProduct);
+}
+
+// Create product medias for wix-store
+function addProductMedia(productId, mediaData) {
+    return wixStoresBackend.addProductMedia(productId, mediaData);
+}
+
+// Add product to collections in wix-store
+function addProductsToCollection(collectionId, productIds) {
+    return wixStoresBackend.addProductsToCollection(collectionId, productIds);
+}
+
+
+// Create fetch url with apiKey and account 
+// This url will be used for fetching products from external source
+async function constructUrl() {
+    const account = await getSecret("account");
+    const apiKey = await getSecret("apiKey");
+    const url = `${baseUrl}${endpoint}?account=${account}&ApiKey=${apiKey}&language=${language}&nonStandardColumns=${colValues[0]}&nonStandardColumns=${colValues[1]}&nonStandardColumns=${colValues[2]}&nonStandardColumns=${colValues[3]}&nonStandardColumns=${colValues[4]}`;
+    return url;
+}
+
+// Before creating a product we have to create a products object.
+// Here we are creating a product object with required informations
+export function polishProduct(product) {
+
+    let des = product.description;
+    let price = product.price
+
+    if (des.length > 80) {
+        des = des.substring(0, 77) + "...";
+    }
+        
+    try{
+        price = price + (price * 0.2)
+    }catch (e){
+        console.log(e)
+    }
+
+    // let description = `${product.narrative}<p><b>Descriptions:</b></br>${reformattingDescriptions(product.longDescription)}</br><b>Spacifications:</b>${reformattingSpacifications(product.specifications,)}</p>`;
+    let description = `${product.narrative}<p><b>Descriptions:</b></br>${reformattingDescriptions(product.longDescription)}</p>`;
+
+    return {
+        "name": des,
+        // "description": reformattingDescriptions(product.longDescription),
+        "description": description.replace(/\u00a0/g, " "),
+        "price": price,
+        "sku": product.stockCode,
+        "visible": true,
+        "manageVariants": false,
+        "productType": "physical",
+        "seoData": {
+            "tags": [{
+                    "type": "title",
+                    "children": product.description,
+                    "custom": false,
+                    "disabled": false
+                },
+                {
+                    "type": "meta",
+                    "props": {
+                        "name": product.description,
+                        "content": product.longDescription
+                    },
+                    "custom": false,
+                    "disabled": false
+                }
+            ]
+        }
+    }
+
+}
+
+// If created product has images then this method will parse and add them
+async function mediaSync(productId, product) {
+    const mediaData = []
+
+    product.images.forEach(src => {
+        mediaData.push({
+            src
+        });
+    });
+
+    addProductMedia(productId, mediaData)
+}
+
+
+// Get products from external sources
+async function getData(url) {
+    const response = await fetch(url, {
+        method: 'GET', // *GET, POST, PUT, DELETE, etc.
+        mode: 'cors', // no-cors, *cors, same-origin
+        cache: 'no-cache', // *default, no-cache, reload, force-cache, only-if-cached
+        credentials: 'same-origin', // include, *same-origin, omit
+        headers: {
+            'Content-Type': 'application/json'
+            // 'Content-Type': 'application/x-www-form-urlencoded',
+        },
+    });
+    return response.json(); // parses JSON response into native JavaScript objects
+}
+
+
+function isEmpty(obj) {
+    return Object.keys(obj).length === 0 && obj.constructor === Object;
+}
+
+
+// Send alert to the site admin to add collections manually
+export function notifyOwnerOnDashboard(body) {
+
+    console.log("Sending------");
+
+    notifications.notify(
+        "Hey! you have to add some collections manually.",
+        ["Dashboard", "Browser", "Mobile"], {
+            "title": "Collections that doesn't exist on your site.",
+            "actionTitle": "Click here!",
+            "actionTarget": {
+                "url": "https://abukaiser.wixsite.com/aka97/collection"
+            },
+            "recipients": {
+                "role": "All_Contributors"
+            }
+        }
+    );
+
+}
+
+
+async function retrieveAllProducts() {
+    let results = await wixData.query("Stores/Products")
+        .limit(100)
+        .find();
+    let allItems = results.items;
+    while (results.hasNext()) {
+        results = await results.next();
+        allItems = allItems.concat(results.items);
+    }
+    return allItems;
+}
+
+
+async function retrieveAllCollections() {
+    let results = await wixData.query("Stores/Collections")
+        .limit(100)
+        .find();
+    let allItems = results.items;
+    while (results.hasNext()) {
+        results = await results.next();
+        allItems = allItems.concat(results.items);
+    }
+    return allItems;
+}
+
+
+// This function will be called every 1 hours
+export async function fetchProducts() {
+    // Get external source url
+    const url = await constructUrl();
+
+    // GET response from the given url
+    await getData(url).then(async (extrernalProducts) => {
+
+        try {
+            let internalProducts = await retrieveAllProducts();
+
+            for (const [extIndex, extProduct] of extrernalProducts.entries()) {
+                //if (extIndex === 2) break;
+                //if (extIndex > 2 && extIndex < 5)
+                if (internalProducts.length == 0) {
+                    createProduct(polishProduct(extProduct))
+                } else {
+                    var results = internalProducts.filter(function(intProduct) {
+                        return extProduct.stockCode == intProduct.sku;
+                    });
+
+                    if (results.length === 0) {
+                        console.log(extIndex)
+                        createProduct(polishProduct(extProduct))
+                    }
+                }
+
+            }
+        } catch (Exception) {
+            console.log(Exception);
+        }
+
+    });
+
+}
+
+
+// This function will be called every 1 hours
+export async function updateProductsDescription() {
+    // Get external source url
+    const url = await constructUrl();
+
+    // GET response from the given url
+    await getData(url).then(async (extrernalProducts) => {
+
+        try {
+            let internalProducts = await retrieveAllProducts();
+
+            for (const [_, extProduct] of extrernalProducts.entries()) {
+
+                if (internalProducts.length != 0) {
+                    var results = internalProducts.filter(function(intProduct) {
+                        return extProduct.stockCode == intProduct.sku;
+                    });
+
+                    if (results.length != 0) {
+                        let description = `${extProduct.narrative}<p><b>Descriptions:</b></br>${reformattingDescriptions(extProduct.longDescription)}</p>`;
+                        wixStoresBackend.updateProductFields(results[0]._id, {
+                            "description": description,
+                            "price": extProduct.price.toFixed(2),
+                            "discount": {"type": "NONE", "value":"0"}
+                        })
+                        //console.log(extProduct.stockCode)
+                    }
+                }
+            }
+        } catch (Exception) {
+            console.log(Exception);
+        }
+
+    });
+
+}
+
+
+// This function will be called every 1 hours
+export async function increaseProductsPrice() {
+    // Get external source url
+    const url = await constructUrl();
+
+    // GET response from the given url
+    await getData(url).then(async (extrernalProducts) => {
+
+        try {
+            let internalProducts = await retrieveAllProducts();
+
+            for (const [_, extProduct] of extrernalProducts.entries()) {
+
+                if (internalProducts.length != 0) {
+                    var results = internalProducts.filter(function(intProduct) {
+                        return extProduct.stockCode == intProduct.sku;
+                    });
+
+                    if (results.length != 0) {
+                        
+                        let price = extProduct.price
+                        try{
+                            price = price + (price * 0.2)
+                        }catch (e){
+                            console.log(e)
+                        }
+
+                        wixStoresBackend.updateProductFields(results[0]._id, {
+                            "price": price,
+                            "discount": {"type": "NONE", "value":"0"}
+                        })
+                        //console.log(extProduct.stockCode)
+                    }
+                }
+            }
+        } catch (Exception) {
+            console.log(Exception);
+        }
+
+    });
+
+}
+
+
+// This function will be called every 1 hours
+export async function assignImagesToProduct() {
+
+    // Get external source url
+    const url = await constructUrl();
+
+    // GET response from the given url
+    await getData(url).then(async (extrernalProducts) => {
+
+        try {
+            let internalProducts = await retrieveAllProducts();
+
+            for (const [_, extProduct] of extrernalProducts.entries()) {
+
+                if (internalProducts.length != 0) {
+                    var results = internalProducts.filter(function(intProduct) {
+                        return extProduct.stockCode == intProduct.sku;
+                    });
+
+                    if (results.length != 0) {
+                        if (results[0].mediaItems.length === 0) {
+                            mediaSync(results[0]._id, extProduct)
+                        }
+                    }
+                }
+            }
+        } catch (Exception) {
+            console.log(Exception);
+        }
+
+    });
+
+}
+
+
+// This function will be called every 1 hours
+export async function assignProductsToCollections() {
+    let pendingCollections = {};
+
+    // Get external source url
+    const url = await constructUrl();
+
+    // GET response from the given url
+    await getData(url).then(async (extrernalProducts) => {
+
+        try {
+            let internalProducts = await retrieveAllProducts();
+            let collections = await retrieveAllCollections();
+
+
+            for (const [_, extProduct] of extrernalProducts.entries()) {
+
+                if (internalProducts.length != 0) {
+                    var prodResults = internalProducts.filter(function(intProduct) {
+                        return extProduct.stockCode == intProduct.sku;
+                    });
+
+                    if (prodResults.length != 0) {
+
+                        const catSet = new Set(extProduct.categories)
+                        const categories = [...catSet]
+
+                        for (const categorie of categories) {
+
+                            var results = collections.filter(function(collection) {
+                                return collection.name.toLowerCase() === categorie.toLowerCase();
+                            });
+
+                            if (results.length != 0) {
+                                addProductsToCollection(results[0]._id, [prodResults[0]._id])
+                            } else {
+
+                                if (!(categorie in pendingCollections)) {
+                                    pendingCollections[categorie] = [];
+                                }
+                                pendingCollections[categorie].push(prodResults[0]._id);
+
+                            }
+
+                        }
+
+                    }
+
+                }
+            }
+
+        } catch (Exception) {
+            console.log(Exception);
+        }
+
+    });
+
+    if (!isEmpty(pendingCollections)) {
+        notifyOwnerOnDashboard(Object.keys(pendingCollections).join(", "));
+    }
+
+    return pendingCollections;
+
+}
+
+
+// This function will be called every 1 hours
+export async function getPendingCollections() {
+    // Get external source url
+    const url = await constructUrl();
+
+    return new Promise((resolve) => {
+
+        // GET response from the given url
+        getData(url).then(async (extrernalProducts) => {
+
+            try {
+                let collections = await retrieveAllCollections();
+                const pendingCollections = [];
+
+
+                for await (const [index, extProduct] of extrernalProducts.entries()) {
+
+                    const catSet = new Set(extProduct.categories)
+                    const categories = [...catSet]
+
+                    for await (const categorie of categories) {
+
+                        var results = await collections.filter(function(collection) {
+                            return collection.name.toLowerCase() === categorie.toLowerCase();
+                        });
+
+                        if (results.length === 0) {
+                            //console.log(categorie)
+                            pendingCollections.push(categorie);
+                        }
+
+                        if (index == extrernalProducts.length - 1) {
+                            resolve([...new Set(pendingCollections)]);
+                        }
+
+                    }
+                }
+
+            } catch (Exception) {
+                console.log(Exception);
+            }
+        });
+    });
+}
